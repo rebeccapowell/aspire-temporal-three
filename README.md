@@ -12,6 +12,7 @@ Our first PR focused on showing how [Temporal](https://temporal.io/) can run alo
 - **Api** – exposes endpoints for starting, signalling and querying a workflow.
 - **Worker** – executes the workflow logic.
 - **Workflows** – shared workflow and activity implementations.
+- **KeyVaultSeeder** - seeds the Key Vault emulator so encryption keys are available.
 
 A trimmed version of `AppHost/Program.cs` illustrates the basics:
 
@@ -30,18 +31,38 @@ temporal.PublishAsConnectionString();
 var cache = builder.AddRedis("cache").WithRedisCommander();
 cache.PublishAsConnectionString();
 
-builder.AddProject<Api>("api")
+var keyVault = builder.AddAzureKeyVault("keyvault").RunAsEmulator();
+keyVault.PublishAsConnectionString();
+var vaultUri = keyVault.Resource.VaultUri.Value;
+builder.Services.AddAzureKeyVaultEmulator(vaultUri, true, true, false);
+
+IResourceBuilder<ProjectResource>? seeder = null;
+if (!builder.ExecutionContext.IsPublishMode)
+    seeder = builder.AddProject<KeyVaultSeeder>("keyvaultseeder")
+        .WithReference(keyVault)
+        .WithReference(cache)
+        .WithArgs("seed");
+
+var api = builder.AddProject<Api>("api")
     .WithReference(temporal)
+    .WithReference(keyVault)
     .WithReference(cache);
-builder.AddProject<Worker>("worker")
+var worker = builder.AddProject<Worker>("worker")
     .WithReference(temporal)
+    .WithReference(keyVault)
     .WithReference(cache);
+
+if (seeder is not null)
+{
+    api.WaitForCompletion(seeder);
+    worker.WaitForCompletion(seeder);
+}
 
 var app = builder.Build();
 await app.StartAsync();
 await app.WaitForShutdownAsync();
-```
 
+```
 At this point running `dotnet run --project AppHost` launched Temporal and we could POST to `/start/{message}` to kick off a workflow. The worker used `Temporalio.Extensions.Hosting` to register the `SimpleWorkflow` and its activities.
 ## Dependency Overview
 
@@ -49,8 +70,8 @@ Several NuGet packages make this sample tick:
 
 - `InfinityFlow.Aspire.Temporal` spins up a Temporal dev server via Aspire so there is no separate install.
 - `Temporalio` and the `Temporalio.Extensions.*` packages provide the .NET SDK and OpenTelemetry wiring.
-- `Aspire.StackExchange.Redis` configures Redis and exposes a connection string for dependent projects.
-- `AzureKeyVaultEmulator.Client` plus `AzureKeyVaultEmulator.Aspire.Hosting` stand up a local Key Vault.
+- `Aspire.StackExchange.Redis` configures Redis and exposes a connection string for dependent projects. We use it to cache key identifiers shared by the API, Worker and Seeder.
+- `AzureKeyVaultEmulator.Aspire.Hosting` runs the emulator. `AzureKeyVaultEmulator.Client` and `Azure.Security.KeyVault.Secrets` let each service access it.
 
 These pieces let us run Temporal, Redis and the emulator entirely from the Aspire host, keeping setup simple.
 
